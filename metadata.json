@@ -1,0 +1,8 @@
+{
+  "name": "Gestión de Cometidos Hospital de Curepto",
+  "description": "Sistema moderno para la gestión, autorización y seguimiento de cometidos funcionarios del Hospital de Curepto, con integración de ClaveÚnica y flujo de aprobación.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

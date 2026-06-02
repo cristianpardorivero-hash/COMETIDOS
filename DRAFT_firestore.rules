@@ -1,0 +1,143 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helper Functions ---
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function hasRole(role) {
+      return isSignedIn() && getUserData().rol == role;
+    }
+
+    function isAdmin() {
+      return hasRole('Administrador');
+    }
+
+    // --- Entity Validations ---
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'nombre', 'rut', 'email', 'servicioId', 'cargo', 'rol', 'activo']) &&
+             data.keys().size() >= 8 &&
+             data.uid == request.auth.uid &&
+             data.nombre is string && data.nombre.size() <= 200 &&
+             data.rut is string && data.rut.size() <= 12 &&
+             data.email == request.auth.token.email &&
+             data.rol in ['Funcionario', 'Jefatura de Servicio', 'Director', 'Personal', 'Finanzas', 'Administrador'] &&
+             data.activo is bool;
+    }
+
+    function isValidCometido(data) {
+      return data.keys().hasAll(['funcionarioUid', 'motivo', 'ciudad', 'estado']) &&
+             data.funcionarioUid is string && data.funcionarioUid.size() <= 128 &&
+             data.motivo is string && data.motivo.size() <= 500 &&
+             data.ciudad is string && data.ciudad.size() <= 100 &&
+             data.estado is string && data.estado.size() <= 100;
+    }
+
+    // --- Collection Rules ---
+
+    // USERS
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if hasRole('Administrador') || hasRole('Personal') || hasRole('Finanzas');
+      
+      allow create: if isOwner(userId) && isValidUser(incoming()) && incoming().rol == 'Funcionario';
+      
+      allow update: if isAdmin() || (
+        isOwner(userId) && 
+        isValidUser(incoming()) && 
+        incoming().rol == existing().rol && // Cannot change own role
+        incoming().diff(existing()).affectedKeys().hasOnly(['nombre', 'rut', 'servicioId', 'servicioNombre', 'cargo'])
+      );
+    }
+
+    // SERVICIOS
+    match /servicios/{servicioId} {
+      allow read: if isSignedIn();
+      allow write: if hasRole('Administrador');
+    }
+
+    // COMETIDOS
+    match /cometidos/{cometidoId} {
+      allow get: if isSignedIn(); // Basic access, could be hardened
+      allow list: if isSignedIn() && (
+        resource.data.funcionarioUid == request.auth.uid || 
+        hasRole('Administrador') || 
+        hasRole('Personal') || 
+        hasRole('Finanzas') || 
+        hasRole('Director') ||
+        (hasRole('Jefatura de Servicio') && getUserData().servicioId == resource.data.servicioId)
+      );
+
+      allow create: if isSignedIn() && 
+                      isValidCometido(incoming()) && 
+                      incoming().funcionarioUid == request.auth.uid &&
+                      incoming().estado == 'Pendiente revisión jefatura';
+
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        // Action: Funcionario Edit (Borrador/Devuelto)
+        (isOwner(existing().funcionarioUid) && 
+         existing().estado in ['Borrador', 'Devuelto por jefatura', 'Devuelto por Dirección'] &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['motivo', 'destino', 'ciudad', 'fechaInicio', 'fechaTermino', 'estado', 'updatedAt'])) ||
+        
+        // Action: Jefatura Review
+        (hasRole('Jefatura de Servicio') && 
+         getUserData().servicioId == existing().servicioId &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['estado', 'decisionJefatura', 'observacionJefatura', 'updatedAt', 'jefaturaUid'])) ||
+        
+        // Action: Director Review
+        (hasRole('Director') && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['estado', 'decisionDirector', 'observacionDirector', 'updatedAt'])) ||
+
+        // Action: Personal Processing
+        (hasRole('Personal') && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['estado', 'revisionPersonal', 'resolucionAdministrativa', 'observacionPersonal', 'updatedAt'])) ||
+
+        // Action: Finanzas Processing
+        (hasRole('Finanzas') && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['estado', 'correspondeViatico', 'montoEstimado', 'montoPagado', 'fechaPago', 'medioPago', 'comprobantePago', 'observacionFinanzas', 'updatedAt']))
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // HISTORIAL
+    match /historial_cometidos/{historialId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && incoming().usuarioUid == request.auth.uid;
+    }
+  }
+}

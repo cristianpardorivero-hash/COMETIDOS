@@ -1,0 +1,173 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // --- Helper Functions ---
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isEmailVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function getUserData() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data
+        : null;
+    }
+
+    function hasRole(role) {
+      let data = getUserData();
+      return data != null && 
+        (
+          (('roles' in data) && (role in data.roles || (role + " ") in data.roles)) || 
+          (('rol' in data) && (data.rol == role || data.rol == (role + " ")))
+        );
+    }
+
+    function isAdmin() {
+      let data = getUserData();
+      return data != null && 
+        (
+          (('roles' in data) && ('Administrador' in data.roles || 'Administrador ' in data.roles)) || 
+          (('rol' in data) && (data.rol == 'Administrador' || data.rol == 'Administrador '))
+        );
+    }
+
+    // --- Entity Validations ---
+    
+    function isValidCometido(data) {
+      return data.keys().hasAll(['funcionarioUid', 'motivo', 'ciudad', 'estado']) &&
+             data.funcionarioUid is string && data.funcionarioUid.size() <= 128 &&
+             data.motivo is string && data.motivo.size() <= 1000 &&
+             data.ciudad is string && data.ciudad.size() <= 100 &&
+             data.estado is string && data.estado.size() <= 100;
+    }
+
+    // --- Collection Rules ---
+    
+    // USERS
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn();
+      
+      allow create: if isSignedIn() && (
+        isOwner(userId) || isAdmin()
+      );
+      
+      allow update: if isSignedIn() && (
+        isAdmin() || 
+        (isOwner(userId) && request.auth.token.email == 'cristianpardorivero@gmail.com') ||
+        (isOwner(userId) && 
+         // Allow users to update their own basic info but NOT their roles
+         (!('roles' in incoming()) || incoming().roles == existing().roles) &&
+         (!('rol' in incoming()) || incoming().rol == existing().rol) &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['nombre', 'rut', 'servicioId', 'servicioNombre', 'cargo', 'grado', 'ley', 'planta', 'genero']))
+      );
+
+      allow delete: if isAdmin() || (isSignedIn() && existing().email == request.auth.token.email);
+    }
+
+    // SERVICIOS
+    match /servicios/{servicioId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // COMETIDOS
+    match /cometidos/{cometidoId} {
+      allow get: if true; // Publicly verifiable via QR
+      allow list: if isSignedIn();
+
+      allow create: if isSignedIn() && 
+                      isValidCometido(incoming()) && 
+                      incoming().funcionarioUid == request.auth.uid &&
+                      incoming().estado == 'Pendiente revisión jefatura';
+
+      allow update: if isSignedIn() && isValidCometido(incoming()) && (
+        isAdmin() ||
+        // Action: Funcionario Edit (Borrador/Devuelto)
+        (isOwner(existing().funcionarioUid) && 
+         existing().estado in ['Borrador', 'Devuelto por jefatura', 'Devuelto por Dirección', 'Devuelto para corrección'] &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['tipoCometido', 'motivo', 'destino', 'ciudad', 'region', 'fechaInicio', 'horaInicio', 'fechaTermino', 'horaTermino', 'medioTransporte', 'requiereTraslado', 'fueraDeCurepto', 'aplicaDistancia', 'pernoctado', 'documentosAdjuntos', 'posibleViatico', 'observacionesFuncionario', 'estado', 'firmaFuncionario', 'selloDigitalFuncionario', 'updatedAt'])) ||
+        
+        // Action: Jefatura Review
+        (hasRole('Jefatura de Servicio') && 
+         getUserData().servicioId == existing().servicioId &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['estado', 'decisionJefatura', 'observacionJefatura', 'fechaDecisionJefatura', 'firmaJefatura', 'selloDigitalJefatura', 'nombreJefatura', 'rutJefatura', 'cargoJefatura', 'updatedAt', 'jefaturaUid'])) ||
+        
+        // Action: Director Review
+        (hasRole('Director') && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['estado', 'decisionDirector', 'observacionDirector', 'fechaDecisionDirector', 'firmaDirector', 'selloDigitalDirector', 'nombreDirector', 'rutDirector', 'cargoDirector', 'updatedAt'])) ||
+
+        // Action: Personal Processing
+        (hasRole('Personal') && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['estado', 'revisionPersonal', 'fechaRevisionPersonal', 'resolucionAdministrativa', 'observacionPersonal', 'updatedAt'])) ||
+
+        // Action: Finanzas Processing
+        (hasRole('Finanzas') && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['estado', 'correspondeViatico', 'montoEstimado', 'montoPagado', 'fechaPago', 'medioPago', 'comprobantePago', 'observacionFinanzas', 'fechaFinanzas', 'updatedAt']))
+      );
+
+      allow delete: if isAdmin();
+    }
+
+    // HISTORIAL
+    match /historial_cometidos/{historialId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && incoming().usuarioUid == request.auth.uid;
+    }
+
+    // COUNTERS
+    match /counters/{counterId} {
+      allow read: if isSignedIn();
+      allow write: if hasRole('Personal') || isAdmin();
+    }
+
+    // VIATICOS VALORES
+    match /viaticos_valores/{viaticoId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // REEMPLAZOS
+    match /reemplazos/{reemplazoId} {
+      allow get: if true; // Publicly verifiable via QR
+      allow list: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update: if isSignedIn();
+      allow delete: if isAdmin();
+    }
+
+    // NOTIFICACIONES
+    match /notificaciones/{notificacionId} {
+      allow read, list: if isSignedIn() && existing().usuarioUid == request.auth.uid;
+      allow create: if isSignedIn();
+      allow update: if isSignedIn() && existing().usuarioUid == request.auth.uid;
+      allow delete: if isAdmin();
+    }
+
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
